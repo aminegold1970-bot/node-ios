@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14-xlarge
+    runs-on: macos-15
     timeout-minutes: 360
     env:
       NODE_REF: ${{ github.event.inputs.node_ref || 'v22.19.0' }}
