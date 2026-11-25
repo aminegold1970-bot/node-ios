@@ -8,7 +8,7 @@ on:
     inputs:
       node_ref:
         description: "Node.js git tag to build (e.g. v22.19.0)"
-        default: "v22.19.0"
+        default: "v22.23.4"
   push:
     paths:
       - ".github/workflows/build.yml"
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-16
+    runs-on: macos-26
     timeout-minutes: 360
     env:
       NODE_REF: ${{ github.event.inputs.node_ref || 'v22.19.0' }}
