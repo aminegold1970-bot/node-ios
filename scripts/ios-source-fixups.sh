@@ -74,6 +74,23 @@ open(f, "w").write(s)
 print("fixup: common.gypi links CoreFoundation/CoreServices/Security on iOS")
 PY
 
+# --- faster cold builds: Release -O2 instead of -O3 ---
+# A cold iOS/V8 build at -O3 takes ~2h40m on the 3-core macOS runner and -j3 OOMs.
+# Node's Release config hard-codes -O3 in common.gypi; -O2 compiles substantially
+# faster (and with lower peak memory) while preserving JIT/WASM behavior.
+python3 - "common.gypi" <<'PY'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+old = "        'cflags': [ '-O3' ],"
+new = "        'cflags': [ '-O2' ],"
+if old not in s:
+    raise SystemExit("common.gypi -O3 anchor not found — Node layout changed?")
+s = s.replace(old, new, 1)
+open(f, "w").write(s)
+print("fixup: common.gypi Release optimization -O3 -> -O2 for faster cold builds")
+PY
+
 # --- V8: don't use MAP_JIT on iOS ---
 # platform-posix.cc requests MAP_JIT pages for all Darwin. On the A9 MAP_JIT returns EINVAL
 # (it's an A11+/APRR feature), so we exclude iOS and let V8 fall back to plain anonymous
@@ -283,19 +300,20 @@ fi
 
 # --- verify every fixup actually landed (fail loudly on future Node layouts) ---
 python3 - <<'PY'
-checks = {
-    "tools/gyp/pylib/gyp/generator/make.py": (False, "-Wl,--start-group"),
-    "src/crypto/crypto_context.cc": (True, "TARGET_OS_OSX"),
-    "common.gypi": (True, "-framework CoreFoundation"),
-    "deps/v8/src/base/platform/platform-posix.cc": (True, "V8_OS_DARWIN && !defined(V8_OS_IOS)"),
-    "deps/v8/src/base/build_config.h": (True, "(defined(V8_OS_MACOS) || defined(V8_OS_IOS))"),
-    "deps/v8/src/base/platform/platform.h": (True, "RegisterJitRange"),
-    "deps/v8/src/base/platform/platform-darwin.cc": (True, "kMaxJitRanges"),
-    "deps/v8/src/heap/code-range.cc": (True, "::v8::base::RegisterJitRange"),
-    "deps/v8/src/wasm/wasm-code-manager.cc": (True, "Commit RW and register the region"),
-    "deps/cares/config/darwin/ares_config.h": (True, "undef HAVE_SYS_RANDOM_H"),
-}
-for path, (want, needle) in checks.items():
+checks = [
+    ("tools/gyp/pylib/gyp/generator/make.py", False, "-Wl,--start-group"),
+    ("src/crypto/crypto_context.cc", True, "TARGET_OS_OSX"),
+    ("common.gypi", True, "-framework CoreFoundation"),
+    ("common.gypi", True, "'cflags': [ '-O2' ]"),
+    ("deps/v8/src/base/platform/platform-posix.cc", True, "V8_OS_DARWIN && !defined(V8_OS_IOS)"),
+    ("deps/v8/src/base/build_config.h", True, "(defined(V8_OS_MACOS) || defined(V8_OS_IOS))"),
+    ("deps/v8/src/base/platform/platform.h", True, "RegisterJitRange"),
+    ("deps/v8/src/base/platform/platform-darwin.cc", True, "kMaxJitRanges"),
+    ("deps/v8/src/heap/code-range.cc", True, "::v8::base::RegisterJitRange"),
+    ("deps/v8/src/wasm/wasm-code-manager.cc", True, "Commit RW and register the region"),
+    ("deps/cares/config/darwin/ares_config.h", True, "undef HAVE_SYS_RANDOM_H"),
+]
+for path, want, needle in checks:
     try:
         text = open(path).read()
     except OSError as exc:

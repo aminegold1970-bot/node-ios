@@ -80,17 +80,23 @@ jobs:
           set -uxo pipefail
           export CCACHE_DIR="$HOME/.ccache"
           set +e
-          # -j2 (not logicalcpu=3): the V8 W^X JIT patch flips a macro in build_config.h,
-          # which is included across ALL of V8, so every V8 TU is a cold ccache miss. Three
-          # concurrent cold -O3 V8 compiles OOM-kill the 3-core/7GB macOS runner (silent
-          # SIGKILL, no clang error). -j2 keeps peak memory under the ceiling.
-          make -j2 2>&1 | tee build.log
+          # The V8 W^X patch invalidates all V8 TUs in ccache on a cold build. We build at
+          # -O2 (see ios-source-fixups.sh) and use -j3 on the 3-core runner; if that still
+          # gets OOM-killed, retry with -j2 — ccache keeps the objects that already built,
+          # so the retry only recompiles the few lost TUs.
+          make -j3 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
-          echo "make rc=$rc"
+          echo "make -j3 rc=$rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "retrying with -j2 (incremental; ccache retains successful objects)"
+            make -j2 2>&1 | tee -a build.log
+            rc=${PIPESTATUS[0]}
+            echo "make -j2 rc=$rc"
+          fi
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "=== errors ==="
-            grep -nE "error:|fatal error|Error [0-9]|ld: |Undefined symbols|clang: error" build.log \
+            grep -nE "error:|fatal error|Error [0-9]|ld: |Undefined symbols|clang: error|Killed" build.log \
               | grep -viE "no newline|Wnewline-eof|#warning|_GLIBCXX" | tail -60
             exit 1
           fi
