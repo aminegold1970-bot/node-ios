@@ -3,6 +3,9 @@
 # Applied after clone, before configure. Accumulates targeted deltas for iOS-SDK
 # mismatches in Node's bundled deps (cheaper + more version-robust than .patch files).
 set -eux
+# Node's sources contain UTF-8; make the embedded Python readers use UTF-8 even
+# when run from a Windows shell (CI on macOS defaults to UTF-8 already).
+export PYTHONUTF8=1
 SRC="${1:?usage: ios-source-fixups.sh <node-src-dir>}"
 cd "$SRC"
 
@@ -97,13 +100,14 @@ PY
 # With it off, V8 assumes code memory is permanently RWX and writes unguarded; those writes
 # then fault the instant a page is RX (observed on-device: EXC_BAD_ACCESS code=2, a WRITE
 # fault, in FreeListManyCachedFastPathBase::Allocate during Sparkplug code allocation).
-# Fix, 4 files:
+# Fix, 5 files (Node 24 / V8 13.6 layout):
 #   (A) turn the macro ON for iOS device too -> activates ALL of V8's write wrapping
 #       (the machinery is already correct for APRR Macs; it was just switched off).
 #   (B/C) reroute the actual flip primitive from pthread_jit_write_protect_np (a no-op on
-#       the A9) to mprotect over the registered code range.
-#   (D) register that bounded code region, and skip the macOS-only RWX code-range setup on
-#       iOS (iOS rejects RWX; committed code pages start RW).
+#       the A9) to mprotect over the registered code ranges.
+#   (D) register the bounded JS code range. V8 13.6 already skips its macOS-only
+#       RWX code-range setup on iOS (iOS rejects RWX; committed code pages start RW).
+#   (E) register WASM code regions too; they live in a separate code space.
 # Run node --predictable so the process-wide mprotect flip has no W^X race with a
 # background compiler thread.
 python3 - <<'PY'
@@ -114,9 +118,12 @@ def patch(path, anchor, inject):
     open(path, "w").write(s.replace(anchor, inject, 1))
 
 # (A) build_config.h: enable the pthread-JIT-write-protect macro on iOS device too.
+# Node 24 / V8 13.6 simplified the guard to just V8_OS_MACOS and added a separate
+# BrowserEngineCore (BECORE) mechanism for iOS 17.4+. We build with min iOS 15,
+# so BECORE is off; enabling the pthread macro routes V8's write scopes through
+# the mprotect implementation below.
 patch("deps/v8/src/base/build_config.h",
-'''#if defined(V8_HOST_ARCH_ARM64) && \\
-    (defined(V8_OS_MACOS) || (defined(V8_OS_IOS) && TARGET_OS_SIMULATOR))
+'''#if defined(V8_HOST_ARCH_ARM64) && defined(V8_OS_MACOS)
 #define V8_HAS_PTHREAD_JIT_WRITE_PROTECT 1''',
 '''#if defined(V8_HOST_ARCH_ARM64) && \\
     (defined(V8_OS_MACOS) || defined(V8_OS_IOS))
@@ -207,75 +214,57 @@ patch("deps/v8/src/heap/code-range.cc",
 '''#include "src/utils/allocation.h"
 #include "src/base/platform/platform.h"''')
 
-# (D) code-range.cc: on iOS skip the macOS-only RWX code-range setup (iOS rejects
-# RWX and CHECK_EQ(reserved_area,0) may not hold) and instead register the bounded
-# code region for the mprotect flip. Committed code pages start RW.
-patch("deps/v8/src/heap/code-range.cc",
-'''  if (V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT &&
-      params.jit == JitPermission::kMapAsJittable) {''',
-'''#if !defined(V8_OS_IOS)
-  if (V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT &&
-      params.jit == JitPermission::kMapAsJittable) {''')
-
+# (D) code-range.cc: V8 13.6 already skips its macOS-only RWX precommit block on
+# iOS (iOS rejects RWX). Just register the bounded code cage for the mprotect
+# flip; committed code pages start RW.
 patch("deps/v8/src/heap/code-range.cc",
 '''    if (!params.page_allocator->DiscardSystemPages(base, size)) return false;
   }
+#endif  // !defined(V8_OS_WIN)
+
   return true;
 }''',
 '''    if (!params.page_allocator->DiscardSystemPages(base, size)) return false;
   }
-#else
+#endif  // !defined(V8_OS_WIN)
+#if defined(V8_OS_IOS)
   ::v8::base::RegisterJitRange(
       reinterpret_cast<void*>(page_allocator_->begin()),
       page_allocator_->size());
 #endif
+
   return true;
 }''')
 
 # (E) wasm-code-manager.cc: WASM has its OWN code space (separate from the JS
-# code range), committed via WasmCodeManager::Commit with kReadWriteExecute. On
-# iOS that RWX request is silently downgraded to RW, so WASM code is never
-# executable -> its jump table faults on the first call (observed on-device:
-# EXC_BAD_ACCESS code=2 executing a RW WASM jump-table page, right after
-# WebAssembly.Module compiles). WASM code writes already go through
-# RwxMemoryWriteScope -> base::SetJitWriteProtected (same chain the JS JIT uses),
-# so the ONLY missing piece is that the WASM region isn't in the flip's range
-# set. Fix: commit the WASM region RW (not the downgraded RWX) and register it,
-# so the same mprotect W^X flip toggles it RW<->RX exactly like the JS range.
-#
-# (E1) request kReadWrite on iOS instead of kReadWriteExecute.
+# code range). V8 13.6's TryAllocate() already skips RWX permission setup on
+# iOS, but WasmCodeManager::Commit() still does an unconditional
+# RecommitPages(..., kReadWriteExecute). iOS silently downgrades that to RW, so
+# WASM code never becomes executable and its jump table faults on first call.
+# Commit RW on iOS and register the region so the same mprotect W^X flip used by
+# the JS code range toggles it RW<->RX.
 patch("deps/v8/src/wasm/wasm-code-manager.cc",
-'''  // Allocate with RWX permissions; this will be restricted via PKU if
-  // available and enabled.
-  PageAllocator::Permission permission = PageAllocator::kReadWriteExecute;''',
-'''  // Allocate with RWX permissions; this will be restricted via PKU if
-  // available and enabled.
-#if defined(V8_OS_IOS)
-  // iOS enforces W^X even for dynamic-codesigning processes: an RWX request is
-  // silently downgraded to RW, so WASM code would never become executable.
-  // Commit RW and register the region (below) with the same mprotect W^X flip
-  // the JS code range uses.
-  PageAllocator::Permission permission = PageAllocator::kReadWrite;
-#else
-  PageAllocator::Permission permission = PageAllocator::kReadWriteExecute;
-#endif''')
-
-# (E2) after the (non-PKU) commit succeeds, register the WASM region for the flip.
-patch("deps/v8/src/wasm/wasm-code-manager.cc",
-'''    success = SetPermissions(GetPlatformPageAllocator(), region.begin(),
-                             region.size(), permission);
-  }
+'''  bool success = GetPlatformPageAllocator()->RecommitPages(
+      reinterpret_cast<void*>(region.begin()), region.size(),
+      PageAllocator::kReadWriteExecute);
 
   if (V8_UNLIKELY(!success)) {''',
-'''    success = SetPermissions(GetPlatformPageAllocator(), region.begin(),
-                             region.size(), permission);
-#if defined(V8_OS_IOS)
-    if (success) {
-      ::v8::base::RegisterJitRange(reinterpret_cast<void*>(region.begin()),
-                                   region.size());
-    }
-#endif
+'''#if defined(V8_OS_IOS)
+  // iOS enforces W^X even for dynamic-codesigning processes: an RWX request is
+  // silently downgraded to RW, so WASM code would never become executable.
+  // Commit RW and register the region with the mprotect W^X flip.
+  bool success = GetPlatformPageAllocator()->RecommitPages(
+      reinterpret_cast<void*>(region.begin()), region.size(),
+      PageAllocator::kReadWrite);
+  if (success) {
+    ::v8::base::RegisterJitRange(reinterpret_cast<void*>(region.begin()),
+                                 region.size());
   }
+#else
+  bool success = GetPlatformPageAllocator()->RecommitPages(
+      reinterpret_cast<void*>(region.begin()), region.size(),
+      PageAllocator::kReadWriteExecute);
+#endif
 
   if (V8_UNLIKELY(!success)) {''')
 
@@ -291,5 +280,32 @@ if grep -q '#define HAVE_SYS_RANDOM_H 1' deps/cares/config/darwin/ares_config.h;
     deps/cares/config/darwin/ares_config.h
   echo "fixup: c-ares HAVE_SYS_RANDOM_H undef'd"
 fi
+
+# --- verify every fixup actually landed (fail loudly on future Node layouts) ---
+python3 - <<'PY'
+checks = {
+    "tools/gyp/pylib/gyp/generator/make.py": (False, "-Wl,--start-group"),
+    "src/crypto/crypto_context.cc": (True, "TARGET_OS_OSX"),
+    "common.gypi": (True, "-framework CoreFoundation"),
+    "deps/v8/src/base/platform/platform-posix.cc": (True, "V8_OS_DARWIN && !defined(V8_OS_IOS)"),
+    "deps/v8/src/base/build_config.h": (True, "(defined(V8_OS_MACOS) || defined(V8_OS_IOS))"),
+    "deps/v8/src/base/platform/platform.h": (True, "RegisterJitRange"),
+    "deps/v8/src/base/platform/platform-darwin.cc": (True, "kMaxJitRanges"),
+    "deps/v8/src/heap/code-range.cc": (True, "::v8::base::RegisterJitRange"),
+    "deps/v8/src/wasm/wasm-code-manager.cc": (True, "Commit RW and register the region"),
+    "deps/cares/config/darwin/ares_config.h": (True, "undef HAVE_SYS_RANDOM_H"),
+}
+for path, (want, needle) in checks.items():
+    try:
+        text = open(path).read()
+    except OSError as exc:
+        raise SystemExit("verify: missing " + path + ": " + str(exc))
+    present = needle in text
+    if present != want:
+        raise SystemExit(
+            "verify: %s: expected %s of %r" %
+            (path, "presence" if want else "absence", needle))
+print("fixup: verified all expected patches are present")
+PY
 
 echo "ios-source-fixups: done"

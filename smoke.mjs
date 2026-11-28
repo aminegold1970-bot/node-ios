@@ -10,7 +10,7 @@
 //   ./node --predictable --single-threaded smoke.mjs
 //
 // A --jitless run is useful for diagnosis, but correctly exits nonzero because
-// Node 22 disables WebAssembly in that mode and OpenClaw needs WASM.
+// Node 24 disables WebAssembly in that mode and OpenClaw needs WASM.
 
 import assert from "node:assert/strict";
 
@@ -29,7 +29,7 @@ console.log("ARCH", process.arch, "PLATFORM", process.platform);
 console.log("EXEC_FLAGS", process.execArgv.join(" ") || "(none)");
 
 try {
-  assert.equal(process.version, "v22.19.0");
+  assert.equal(process.version, "v24.21.0");
   assert.equal(process.arch, "arm64");
   // NOTE: a Node built with --dest-os=ios reports process.platform === "ios"
   // (non-standard; NOT "darwin"). Verified on-device. Do not "correct" this.

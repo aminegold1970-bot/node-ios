@@ -35,7 +35,7 @@ console.log("JIT_HOTLOOP_OK", sum | 0);
 assert.equal(6 * 7, 42);
 console.log("ANSWER", 42);
 
-// WASM comes back once JIT works (Node 22 / V8 12.4 disables it under --jitless).
+// WASM comes back once JIT works (Node 24 / V8 13.6 disables it under --jitless).
 // (module (func (export "add") (param i32 i32) (result i32)
 //   local.get 0 local.get 1 i32.add))
 const bytes = new Uint8Array([
